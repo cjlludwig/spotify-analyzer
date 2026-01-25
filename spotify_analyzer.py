@@ -17,6 +17,7 @@ import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Optional
 
 # Rich imports for beautiful CLI output
@@ -58,6 +59,9 @@ FAVORITES_KEYWORDS = [
     "essential", "perfect", "goat", "greatest", "classic", "forever"
 ]
 
+# Active playlist threshold: playlists with additions in the last N days are "active"
+ACTIVE_PLAYLIST_RECENCY_DAYS = 365 * 2  # 6 months
+
 
 # Styles for different fan levels
 FAN_LEVEL_STYLES = {
@@ -74,11 +78,122 @@ TIME_RANGE_LABELS = {
     "long_term": "All Time",
 }
 
+# Cache configuration
+CACHE_DIR = Path(__file__).parent / ".spotify_cache"
+DEFAULT_CACHE_TTL_HOURS = 24  # Default cache expiration
+
+
+def get_cache_path(user_id: str) -> Path:
+    """Get the cache file path for a given user ID."""
+    # Sanitize user ID for filesystem
+    safe_id = re.sub(r'[^\w\-]', '_', user_id)
+    return CACHE_DIR / f"{safe_id}.json"
+
+
+def load_cache(user_id: str) -> Optional[dict]:
+    """Load cached data for a user if it exists and is not expired."""
+    cache_path = get_cache_path(user_id)
+    
+    if not cache_path.exists():
+        return None
+    
+    try:
+        with open(cache_path, "r", encoding="utf-8") as f:
+            cached = json.load(f)
+        
+        # Check if cache is expired
+        cached_at = datetime.fromisoformat(cached.get("cached_at", "1970-01-01T00:00:00"))
+        ttl_hours = cached.get("ttl_hours", DEFAULT_CACHE_TTL_HOURS)
+        
+        if datetime.now() - cached_at > timedelta(hours=ttl_hours):
+            if console and RICH_AVAILABLE:
+                console.print(f"[dim]Cache expired for user {user_id}[/]")
+            return None
+        
+        return cached
+    except (json.JSONDecodeError, KeyError, ValueError) as e:
+        if console and RICH_AVAILABLE:
+            console.print(f"[yellow]Warning:[/] Could not load cache: {e}")
+        return None
+
+
+def save_cache(user_id: str, data: dict, ttl_hours: int = DEFAULT_CACHE_TTL_HOURS) -> None:
+    """Save data to cache for a user."""
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_path = get_cache_path(user_id)
+    
+    cache_data = {
+        "cached_at": datetime.now().isoformat(),
+        "ttl_hours": ttl_hours,
+        "user_id": user_id,
+        **data
+    }
+    
+    try:
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump(cache_data, f, indent=2, ensure_ascii=False)
+        
+        if console and RICH_AVAILABLE:
+            console.print(f"[dim]💾 Cached data for user {user_id}[/]")
+    except OSError as e:
+        if console and RICH_AVAILABLE:
+            console.print(f"[yellow]Warning:[/] Could not save cache: {e}")
+
+
+def clear_cache(user_id: Optional[str] = None) -> None:
+    """Clear cache for a specific user or all users."""
+    if user_id:
+        cache_path = get_cache_path(user_id)
+        if cache_path.exists():
+            cache_path.unlink()
+            if console and RICH_AVAILABLE:
+                console.print(f"[green]✓[/] Cleared cache for user {user_id}")
+    else:
+        if CACHE_DIR.exists():
+            for cache_file in CACHE_DIR.glob("*.json"):
+                cache_file.unlink()
+            if console and RICH_AVAILABLE:
+                console.print("[green]✓[/] Cleared all cached data")
+
 
 def is_favorites_playlist(name: str) -> bool:
     """Check if a playlist name suggests it contains favorites."""
     name_lower = name.lower()
     return any(kw in name_lower for kw in FAVORITES_KEYWORDS)
+
+
+def classify_playlist_activity(name: str, track_count: int, 
+                                newest_add: Optional[datetime] = None) -> tuple[bool, str]:
+    """Classify playlist as active rotation vs archive based on recency.
+    
+    A playlist is considered "active" if it has had tracks added within
+    the recency threshold (default 6 months). This is a simple, reliable
+    heuristic that doesn't depend on naming conventions.
+    
+    Returns:
+        tuple of (is_active: bool, reason: str)
+    """
+    # Purely recency-based: if playlist has recent additions, it's active
+    if newest_add and newest_add > datetime.now() - timedelta(days=ACTIVE_PLAYLIST_RECENCY_DAYS):
+        return True, "recent_additions"
+    
+    # No recent additions = archive/inactive
+    return False, "no_recent_additions"
+
+
+def get_newest_add_date(tracks: list[dict]) -> Optional[datetime]:
+    """Get the most recent added_at date from a list of track items."""
+    dates = []
+    for item in tracks:
+        added_at_str = item.get("added_at")
+        if added_at_str:
+            try:
+                added_at = datetime.fromisoformat(added_at_str.replace('Z', '+00:00'))
+                added_at = added_at.replace(tzinfo=None)
+                dates.append(added_at)
+            except ValueError:
+                pass
+    return max(dates) if dates else None
 
 
 def parse_horizon(horizon_str: str) -> datetime:
@@ -125,6 +240,20 @@ class TrackInfo:
     spotify_url: str
     playlists: list[str] = field(default_factory=list)
     in_favorites_playlist: bool = False
+    popularity: Optional[int] = None
+    duration_ms: Optional[int] = None
+    release_date: Optional[str] = None
+    release_date_precision: Optional[str] = None
+    album_type: Optional[str] = None
+    album_total_tracks: Optional[int] = None
+    added_dates: dict = field(default_factory=dict)  # playlist_name -> datetime
+    is_evergreen: bool = False  # Set by temporal analysis
+    # Playlist metadata for scoring (set at analysis time, not per-track)
+    playlist_sizes: dict = field(default_factory=dict)  # playlist_name -> track_count
+    active_playlists: set = field(default_factory=set)  # set of active playlist names
+    # Aggregate stats for affinity scoring (injected after all tracks processed)
+    artist_track_counts: dict = field(default_factory=dict)  # artist_id -> unique_track_count
+    album_track_counts: dict = field(default_factory=dict)   # album_id -> track_count_in_playlists
     
     @property
     def count(self) -> int:
@@ -141,6 +270,165 @@ class TrackInfo:
         if self.in_favorites_playlist:
             base += 2  # Bonus for being in a favorites playlist
         return base
+    
+    @property
+    def affinity_score(self) -> int:
+        """Enhanced scoring that considers multiple signals of track affinity.
+        
+        Unlike versatility_score which rewards appearing in many playlists,
+        affinity_score tries to identify tracks the user actually loves by
+        combining artist dedication, album depth, playlist presence, and other signals.
+        """
+        score = 0
+        
+        # Playlist count (exponential scaling)
+        if self.count >= 3:
+            score += 35
+        elif self.count >= 2:
+            score += 20
+        else:
+            score += 10
+        
+        if self.in_favorites_playlist:
+            score += 25
+        
+        # Cross-context: favorites + multiple playlists = strong signal
+        if self.in_favorites_playlist and self.count >= 2:
+            score += 10
+        
+        # Artist dedication bonus
+        max_artist_tracks = 0
+        for artist_id in self.artist_ids:
+            if artist_id and artist_id in self.artist_track_counts:
+                max_artist_tracks = max(max_artist_tracks, self.artist_track_counts[artist_id])
+        
+        if max_artist_tracks >= 20:
+            score += 10
+        elif max_artist_tracks >= 15:
+            score += 8
+        elif max_artist_tracks >= 10:
+            score += 6
+        elif max_artist_tracks >= 6:
+            score += 4
+        elif max_artist_tracks >= 3:
+            score += 2
+        
+        # Album depth bonus
+        album_tracks = self.album_track_counts.get(self.album_id, 0) if self.album_id else 0
+        if album_tracks >= 5:
+            score += 15
+        elif album_tracks >= 3:
+            score += 8
+        
+        # Obscurity bonus / popularity penalty
+        if self.popularity is not None:
+            if self.popularity < 30:
+                score += 8
+            elif self.popularity < 50:
+                score += 4
+            elif self.popularity >= 85:
+                score -= 8
+            elif self.popularity >= 75:
+                score -= 4
+        
+        # Recency bonus
+        if self.latest_added:
+            days_ago = (datetime.now() - self.latest_added).days
+            if days_ago < 180:
+                score += 10
+            elif days_ago < 365:
+                score += 5
+        
+        # Early adopter bonus
+        if self.added_dates and self.release_date:
+            try:
+                if self.release_date_precision == "day":
+                    release_dt = datetime.strptime(self.release_date, "%Y-%m-%d")
+                elif self.release_date_precision == "month":
+                    release_dt = datetime.strptime(self.release_date + "-01", "%Y-%m-%d")
+                else:
+                    release_dt = datetime.strptime(self.release_date + "-01-01", "%Y-%m-%d")
+                
+                earliest_add = min(self.added_dates.values()) if self.added_dates else None
+                if earliest_add:
+                    days_after_release = (earliest_add - release_dt).days
+                    if 0 <= days_after_release < 7:
+                        score += 15
+                    elif 0 <= days_after_release < 30:
+                        score += 8
+            except (ValueError, TypeError):
+                pass
+        
+        if self.is_evergreen:
+            score += 15
+        
+        # Small playlist bonus (focused curation)
+        if self.playlist_sizes:
+            for playlist_name in self.playlists:
+                playlist_size = self.playlist_sizes.get(playlist_name, 100)
+                if playlist_size < 30:
+                    score += 12
+                    break
+                elif playlist_size < 50:
+                    score += 6
+                    break
+        
+        if self.active_playlists:
+            active_count = sum(1 for p in self.playlists if p in self.active_playlists)
+            score += active_count * 5
+        
+        return score
+    
+    @property
+    def earliest_added(self) -> Optional[datetime]:
+        """Get the earliest date this track was added to any playlist."""
+        if self.added_dates:
+            return min(self.added_dates.values())
+        return None
+    
+    @property
+    def latest_added(self) -> Optional[datetime]:
+        """Get the latest date this track was added to any playlist."""
+        if self.added_dates:
+            return max(self.added_dates.values())
+        return None
+    
+    @property
+    def versatility_score(self) -> int:
+        """Score measuring how many contexts this track fits (high = universal appeal).
+        
+        Unlike affinity_score which tries to identify actual favorites,
+        versatility_score measures how well a track fits different contexts.
+        A high versatility score means the track appears in many playlists
+        and is globally popular - a "crowd pleaser" that works everywhere.
+        """
+        score = self.count * 10  # Base: raw playlist count
+        
+        # Bonus for high global popularity (mainstream appeal)
+        if self.popularity is not None and self.popularity >= 60:
+            score += 10
+        elif self.popularity is not None and self.popularity >= 40:
+            score += 5
+        
+        # Bonus for appearing in diverse playlist types
+        # Detected by keyword variety in playlist names
+        if len(self.playlists) >= 2:
+            playlist_keywords = set()
+            keyword_categories = {
+                "mood": ["chill", "relax", "happy", "sad", "angry", "hype", "calm"],
+                "activity": ["workout", "gym", "drive", "work", "study", "sleep", "party"],
+                "time": ["morning", "night", "evening", "summer", "winter"],
+            }
+            for playlist in self.playlists:
+                pl_lower = playlist.lower()
+                for category, keywords in keyword_categories.items():
+                    if any(kw in pl_lower for kw in keywords):
+                        playlist_keywords.add(category)
+            
+            # Bonus for appearing in diverse contexts
+            score += len(playlist_keywords) * 5
+        
+        return score
 
 
 @dataclass
@@ -151,6 +439,26 @@ class AlbumStats:
     artist: str
     tracks: list[str] = field(default_factory=list)
     total_appearances: int = 0
+    total_tracks_in_album: Optional[int] = None
+    album_type: Optional[str] = None
+    release_date: Optional[str] = None
+    
+    @property
+    def completion_ratio(self) -> float:
+        """Ratio of album tracks in user's playlists."""
+        if self.total_tracks_in_album and self.total_tracks_in_album > 0:
+            return len(self.tracks) / self.total_tracks_in_album
+        return 0.0
+    
+    @property
+    def is_likely_favorite_album(self) -> bool:
+        """Album is likely a favorite if >50% of tracks are playlisted and at least 3 tracks."""
+        return self.completion_ratio > 0.5 and len(self.tracks) >= 3
+    
+    @property
+    def completion_percentage(self) -> int:
+        """Completion ratio as a percentage for display."""
+        return int(self.completion_ratio * 100)
 
 
 @dataclass 
@@ -206,7 +514,14 @@ class TopArtist:
 class SpotifyAnalyzer:
     """Analyzes a Spotify user's public playlists."""
     
-    def __init__(self, horizon_cutoff: Optional[datetime] = None, use_oauth: bool = False):
+    def __init__(
+        self,
+        horizon_cutoff: Optional[datetime] = None,
+        use_oauth: bool = False,
+        use_cache: bool = True,
+        refresh_cache: bool = False,
+        cache_ttl_hours: int = DEFAULT_CACHE_TTL_HOURS,
+    ):
         client_id = os.getenv("SPOTIPY_CLIENT_ID")
         client_secret = os.getenv("SPOTIPY_CLIENT_SECRET")
         
@@ -221,6 +536,9 @@ class SpotifyAnalyzer:
             sys.exit(1)
         
         self.use_oauth = use_oauth
+        self.use_cache = use_cache
+        self.refresh_cache = refresh_cache
+        self.cache_ttl_hours = cache_ttl_hours
         
         if use_oauth:
             # OAuth flow for self-analysis (opens browser)
@@ -246,6 +564,8 @@ class SpotifyAnalyzer:
         self.playlist_names: list[str] = []
         self.horizon_cutoff = horizon_cutoff
         self.tracks_filtered = 0  # Count of tracks filtered out by horizon
+        self.tracks_missing_added_at = 0  # Count of tracks with no added_at date
+        self.playlists_skipped_owner = 0  # Count of playlists not owned by target user
     
     def get_current_user_info(self) -> dict:
         """Fetch the authenticated user's profile information."""
@@ -308,7 +628,6 @@ class SpotifyAnalyzer:
                         "name": playlist["name"],
                         "track_count": playlist.get("tracks", {}).get("total", 0),
                         "owner": playlist.get("owner", {}).get("id", ""),
-                        "is_favorites": is_favorites_playlist(playlist["name"]),
                     })
             
             if results["next"] is None:
@@ -317,6 +636,141 @@ class SpotifyAnalyzer:
             offset += limit
         
         return playlists
+    
+    def fetch_all_playlist_tracks_raw(self, playlists: list[dict]) -> dict[str, list[dict]]:
+        """Fetch all tracks from all playlists and return raw data for caching."""
+        all_tracks: dict[str, list[dict]] = {}
+        
+        if console and RICH_AVAILABLE:
+            console.print()
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(bar_width=40),
+                TaskProgressColumn(),
+                TextColumn("[cyan]{task.fields[current]}[/]"),
+                console=console,
+            ) as progress:
+                task = progress.add_task(
+                    f"[green]Fetching tracks from {len(playlists)} playlists...",
+                    total=len(playlists),
+                    current=""
+                )
+                
+                for playlist in playlists:
+                    marker = " ⭐" if is_favorites_playlist(playlist["name"]) else ""
+                    progress.update(task, current=f"{playlist['name'][:30]}{marker}")
+                    
+                    tracks = self._fetch_playlist_tracks_raw(playlist["id"])
+                    all_tracks[playlist["id"]] = tracks
+                    
+                    progress.advance(task)
+            console.print()
+        else:
+            print(f"Fetching tracks from {len(playlists)} playlists")
+            for i, playlist in enumerate(playlists, 1):
+                print(f"  [{i}/{len(playlists)}] {playlist['name']}")
+                tracks = self._fetch_playlist_tracks_raw(playlist["id"])
+                all_tracks[playlist["id"]] = tracks
+        
+        return all_tracks
+    
+    def _fetch_playlist_tracks_raw(self, playlist_id: str) -> list[dict]:
+        """Fetch all tracks from a single playlist as raw data."""
+        tracks = []
+        offset = 0
+        limit = 100
+        
+        while True:
+            try:
+                results = self.sp.playlist_tracks(
+                    playlist_id,
+                    limit=limit,
+                    offset=offset,
+                    fields="items(added_at,added_by.id,is_local,track(id,name,popularity,duration_ms,explicit,disc_number,track_number,artists(id,name),album(id,name,album_type,release_date,release_date_precision,total_tracks),external_urls)),next"
+                )
+            except spotipy.SpotifyException:
+                break
+            
+            if not results.get("items"):
+                break
+            
+            for item in results["items"]:
+                track = item.get("track")
+                if track and track.get("id"):
+                    album_data = track.get("album", {})
+                    tracks.append({
+                        "added_at": item.get("added_at"),
+                        "added_by_id": item.get("added_by", {}).get("id"),
+                        "is_local": item.get("is_local", False),
+                        "track": {
+                            "id": track["id"],
+                            "name": track["name"],
+                            "popularity": track.get("popularity"),
+                            "duration_ms": track.get("duration_ms"),
+                            "explicit": track.get("explicit"),
+                            "disc_number": track.get("disc_number"),
+                            "track_number": track.get("track_number"),
+                            "artists": [{"id": a.get("id"), "name": a["name"]} for a in track.get("artists", [])],
+                            "album": {
+                                "id": album_data.get("id", ""),
+                                "name": album_data.get("name", "Unknown Album"),
+                                "album_type": album_data.get("album_type"),
+                                "release_date": album_data.get("release_date"),
+                                "release_date_precision": album_data.get("release_date_precision"),
+                                "total_tracks": album_data.get("total_tracks"),
+                            },
+                            "external_urls": track.get("external_urls", {}),
+                        }
+                    })
+            
+            if results.get("next") is None:
+                break
+            
+            offset += limit
+        
+        return tracks
+    
+    def fetch_raw_data(self, user_id: str) -> dict:
+        """Fetch all raw Spotify data for a user (playlists + tracks)."""
+        user_info = self.get_user_info(user_id)
+        playlists = self.get_user_playlists(user_id)
+        playlist_tracks = self.fetch_all_playlist_tracks_raw(playlists)
+        
+        return {
+            "user_info": user_info,
+            "playlists": playlists,
+            "playlist_tracks": playlist_tracks,
+        }
+    
+    def fetch_raw_self_data(self) -> dict:
+        """Fetch all raw Spotify data for the authenticated user."""
+        user_info = self.get_current_user_info()
+        
+        if console and RICH_AVAILABLE:
+            console.print("[dim]Fetching your top tracks and artists...[/]")
+        
+        top_tracks_raw = {}
+        top_artists_raw = {}
+        
+        for time_range in ["short_term", "medium_term", "long_term"]:
+            try:
+                tracks_result = self.sp.current_user_top_tracks(time_range=time_range, limit=20)
+                top_tracks_raw[time_range] = tracks_result.get("items", [])
+            except spotipy.SpotifyException:
+                top_tracks_raw[time_range] = []
+            
+            try:
+                artists_result = self.sp.current_user_top_artists(time_range=time_range, limit=20)
+                top_artists_raw[time_range] = artists_result.get("items", [])
+            except spotipy.SpotifyException:
+                top_artists_raw[time_range] = []
+        
+        return {
+            "user_info": user_info,
+            "top_tracks_raw": top_tracks_raw,
+            "top_artists_raw": top_artists_raw,
+        }
     
     def get_playlist_tracks(self, playlist_id: str, playlist_name: str, is_favorites: bool) -> None:
         """Fetch all tracks from a playlist and add to aggregate."""
@@ -346,16 +800,19 @@ class SpotifyAnalyzer:
                 # Check if track is within the time horizon
                 if self.horizon_cutoff:
                     added_at_str = item.get("added_at")
-                    if added_at_str:
-                        try:
-                            # Parse ISO format timestamp (e.g., "2023-01-15T12:30:00Z")
-                            added_at = datetime.fromisoformat(added_at_str.replace('Z', '+00:00'))
-                            added_at = added_at.replace(tzinfo=None)  # Make naive for comparison
-                            if added_at < self.horizon_cutoff:
-                                self.tracks_filtered += 1
-                                continue  # Skip tracks outside the horizon
-                        except ValueError:
-                            pass  # If parsing fails, include the track
+                    if not added_at_str:
+                        self.tracks_missing_added_at += 1
+                        continue  # Exclude tracks with no added_at when horizon is set
+                    try:
+                        # Parse ISO format timestamp (e.g., "2023-01-15T12:30:00Z")
+                        added_at = datetime.fromisoformat(added_at_str.replace('Z', '+00:00'))
+                        added_at = added_at.replace(tzinfo=None)  # Make naive for comparison
+                        if added_at < self.horizon_cutoff:
+                            self.tracks_filtered += 1
+                            continue  # Skip tracks outside the horizon
+                    except ValueError:
+                        self.tracks_missing_added_at += 1
+                        continue  # Exclude tracks with unparseable added_at
                 
                 track_id = track["id"]
                 
@@ -447,18 +904,26 @@ class SpotifyAnalyzer:
                 albums[track.album_id] = AlbumStats(
                     album_id=track.album_id,
                     name=track.album,
-                    artist=track.artists[0] if track.artists else "Unknown"
+                    artist=track.artists[0] if track.artists else "Unknown",
+                    total_tracks_in_album=track.album_total_tracks,
+                    album_type=track.album_type,
+                    release_date=track.release_date,
                 )
             
             album = albums[track.album_id]
             if track.name not in album.tracks:
                 album.tracks.append(track.name)
             album.total_appearances += track.count
+            
+            # Update total_tracks_in_album if we have it from this track
+            # (in case first track didn't have it but later ones do)
+            if track.album_total_tracks and not album.total_tracks_in_album:
+                album.total_tracks_in_album = track.album_total_tracks
         
-        # Sort by number of unique tracks, then by total appearances
+        # Sort by completion ratio (for albums with known totals), then by unique tracks
         sorted_albums = sorted(
             albums.values(),
-            key=lambda a: (-len(a.tracks), -a.total_appearances)
+            key=lambda a: (-a.completion_ratio, -len(a.tracks), -a.total_appearances)
         )
         
         return sorted_albums
@@ -502,27 +967,149 @@ class SpotifyAnalyzer:
             if t.count > 1 or t.in_favorites_playlist
         ]
         
-        # Sort by weighted score
+        # Sort by affinity score (enhanced scoring)
         return sorted(
             candidates,
-            key=lambda t: (-t.favorites_weight, -t.count, t.name.lower())
+            key=lambda t: (-t.affinity_score, -t.count, t.name.lower())
         )
     
-    def analyze_self(self) -> dict:
-        """Analyze the authenticated user's listening data."""
-        user_info = self.get_current_user_info()
+    def analyze_temporal_patterns(self) -> dict:
+        """Analyze temporal patterns to identify evergreen favorites and early adopter behavior.
         
-        if console and RICH_AVAILABLE:
-            console.print(f"[green]✓[/] Authenticated as: [cyan]{user_info['display_name']}[/]\n")
-            console.print("[dim]Fetching your top tracks and artists...[/]")
+        Returns a dict with:
+        - evergreen_track_ids: list of track IDs that were re-added over 6+ months apart
+        - early_adopter_tracks: list of track IDs added within first week of release
+        - first_month_tracks: list of track IDs added within first month of release
+        """
+        evergreen_track_ids = []
+        early_adopter_tracks = []
+        first_month_tracks = []
         
-        # Fetch top tracks for all time ranges
+        for track_id, track in self.tracks.items():
+            # Check for evergreen favorites: added to multiple playlists over long time span
+            if len(track.added_dates) > 1:
+                dates = list(track.added_dates.values())
+                date_span = max(dates) - min(dates)
+                if date_span.days >= 180:  # 6+ months apart
+                    evergreen_track_ids.append(track_id)
+                    track.is_evergreen = True
+            
+            # Check for early adopter behavior
+            if track.release_date and track.added_dates:
+                try:
+                    # Parse release date
+                    if track.release_date_precision == "day":
+                        release_dt = datetime.strptime(track.release_date, "%Y-%m-%d")
+                    elif track.release_date_precision == "month":
+                        release_dt = datetime.strptime(track.release_date + "-01", "%Y-%m-%d")
+                    else:  # year
+                        release_dt = datetime.strptime(track.release_date + "-01-01", "%Y-%m-%d")
+                    
+                    earliest_add = min(track.added_dates.values())
+                    days_after_release = (earliest_add - release_dt).days
+                    
+                    if 0 <= days_after_release < 7:
+                        early_adopter_tracks.append(track_id)
+                    elif 0 <= days_after_release < 30:
+                        first_month_tracks.append(track_id)
+                except (ValueError, TypeError):
+                    pass
+        
+        return {
+            "evergreen_track_ids": evergreen_track_ids,
+            "early_adopter_tracks": early_adopter_tracks,
+            "first_month_tracks": first_month_tracks,
+            "evergreen_count": len(evergreen_track_ids),
+            "early_adopter_count": len(early_adopter_tracks),
+            "first_month_count": len(first_month_tracks),
+        }
+    
+    def _process_raw_self_data(self, raw_data: dict) -> tuple[dict, dict]:
+        """Process raw cached self data into TopTrack/TopArtist objects."""
         top_tracks = {}
         top_artists = {}
         
         for time_range in ["short_term", "medium_term", "long_term"]:
-            top_tracks[time_range] = self.get_top_tracks(time_range=time_range, limit=20)
-            top_artists[time_range] = self.get_top_artists(time_range=time_range, limit=20)
+            # Process tracks
+            raw_tracks = raw_data.get("top_tracks_raw", {}).get(time_range, [])
+            tracks = []
+            for i, item in enumerate(raw_tracks, 1):
+                tracks.append(TopTrack(
+                    rank=i,
+                    name=item["name"],
+                    artists=[a["name"] for a in item.get("artists", [])],
+                    album=item.get("album", {}).get("name", "Unknown Album"),
+                    spotify_url=item.get("external_urls", {}).get("spotify", ""),
+                ))
+            top_tracks[time_range] = tracks
+            
+            # Process artists
+            raw_artists = raw_data.get("top_artists_raw", {}).get(time_range, [])
+            artists = []
+            for i, item in enumerate(raw_artists, 1):
+                artists.append(TopArtist(
+                    rank=i,
+                    name=item["name"],
+                    genres=item.get("genres", []),
+                    popularity=item.get("popularity", 0),
+                    spotify_url=item.get("external_urls", {}).get("spotify", ""),
+                ))
+            top_artists[time_range] = artists
+        
+        return top_tracks, top_artists
+    
+    def analyze_self(self) -> dict:
+        """Analyze the authenticated user's listening data."""
+        # For self-analysis, we first need to authenticate to get the user ID
+        # Then we can check the cache
+        raw_data = None
+        from_cache = False
+        user_id = None
+        
+        # First, authenticate and get user ID (needed for cache key)
+        # This is a lightweight call that we always make
+        try:
+            user_info = self.get_current_user_info()
+            user_id = f"self_{user_info['id']}"  # Prefix with 'self_' to distinguish from public analysis
+        except Exception:
+            # If we can't get user info, we can't use cache either
+            pass
+        
+        if console and RICH_AVAILABLE:
+            console.print(f"[green]✓[/] Authenticated as: [cyan]{user_info['display_name']}[/]\n")
+        
+        # Try to load from cache
+        if user_id and self.use_cache and not self.refresh_cache:
+            cached = load_cache(user_id)
+            if cached:
+                raw_data = cached
+                from_cache = True
+                if console and RICH_AVAILABLE:
+                    cached_at = cached.get("cached_at", "unknown")
+                    console.print(f"[green]✓[/] Using cached listening data (cached: {cached_at})\n")
+                else:
+                    print(f"Using cached listening data")
+        
+        # Fetch fresh data if not cached
+        if raw_data is None:
+            if self.refresh_cache and console and RICH_AVAILABLE:
+                console.print("[dim]Refreshing cache...[/]")
+            
+            raw_data = self.fetch_raw_self_data()
+            raw_data["user_info"] = user_info  # Add user info to raw data
+            
+            # Save to cache
+            if user_id and self.use_cache:
+                save_cache(user_id, raw_data, ttl_hours=self.cache_ttl_hours)
+        
+        # Process raw data
+        user_info = raw_data["user_info"]
+        
+        if from_cache:
+            if console and RICH_AVAILABLE:
+                console.print("[dim]Processing cached listening data...[/]\n")
+        
+        top_tracks, top_artists = self._process_raw_self_data(raw_data)
         
         # Analyze listening trends (compare short vs long term)
         trends = self._analyze_trends(top_tracks, top_artists)
@@ -533,6 +1120,7 @@ class SpotifyAnalyzer:
             "top_tracks": top_tracks,
             "top_artists": top_artists,
             "trends": trends,
+            "from_cache": from_cache,
         }
     
     def _analyze_trends(self, top_tracks: dict, top_artists: dict) -> dict:
@@ -564,52 +1152,226 @@ class SpotifyAnalyzer:
         
         return trends
     
+    def _process_raw_tracks(self, playlists: list[dict], playlist_tracks: dict[str, list[dict]], target_user_id: str) -> None:
+        """Process raw cached track data into TrackInfo objects.
+        
+        Args:
+            playlists: List of playlist metadata dicts
+            playlist_tracks: Dict mapping playlist_id to list of track items
+            target_user_id: Only process playlists owned by this user
+        """
+        # Filter to only playlists owned by target user
+        owned_playlists = []
+        for p in playlists:
+            if p.get("owner") != target_user_id:
+                self.playlists_skipped_owner += 1
+                continue
+            owned_playlists.append(p)
+        
+        # Build playlist metadata maps for scoring (only from owned playlists)
+        playlist_sizes = {p["name"]: p.get("track_count", 0) for p in owned_playlists}
+        active_playlists = set()
+        
+        for p in owned_playlists:
+            # Get newest add date for this playlist to help classify activity
+            newest_add = get_newest_add_date(playlist_tracks.get(p["id"], []))
+            is_active, _ = classify_playlist_activity(
+                p["name"], 
+                p.get("track_count", 0), 
+                newest_add
+            )
+            if is_active:
+                active_playlists.add(p["name"])
+        
+        # Store for use in analysis output
+        self._playlist_sizes = playlist_sizes
+        self._active_playlists = active_playlists
+        
+        for playlist in owned_playlists:
+            playlist_id = playlist["id"]
+            playlist_name = playlist["name"]
+            # Compute is_favorites at runtime (not cached) so logic changes apply to cached data
+            is_favorites = is_favorites_playlist(playlist_name)
+            
+            tracks = playlist_tracks.get(playlist_id, [])
+            
+            for item in tracks:
+                track = item.get("track")
+                if not track or not track.get("id"):
+                    continue
+                
+                # Skip local files (no useful Spotify metadata)
+                if item.get("is_local", False):
+                    continue
+                
+                # Parse added_at timestamp
+                added_at_str = item.get("added_at")
+                added_at = None
+                if added_at_str:
+                    try:
+                        added_at = datetime.fromisoformat(added_at_str.replace('Z', '+00:00'))
+                        added_at = added_at.replace(tzinfo=None)
+                    except ValueError:
+                        pass
+                
+                # Check if track is within the time horizon
+                if self.horizon_cutoff:
+                    if added_at is None:
+                        self.tracks_missing_added_at += 1
+                        continue  # Exclude tracks with no added_at when horizon is set
+                    if added_at < self.horizon_cutoff:
+                        self.tracks_filtered += 1
+                        continue
+                
+                track_id = track["id"]
+                
+                if track_id in self.tracks:
+                    # Track already seen, update with this playlist's info
+                    if playlist_name not in self.tracks[track_id].playlists:
+                        self.tracks[track_id].playlists.append(playlist_name)
+                    if is_favorites:
+                        self.tracks[track_id].in_favorites_playlist = True
+                    # Add this playlist's added_at to the track's added_dates
+                    if added_at:
+                        self.tracks[track_id].added_dates[playlist_name] = added_at
+                else:
+                    # New track - extract all fields with backward compatibility
+                    artists = [a["name"] for a in track.get("artists", [])]
+                    artist_ids = [a["id"] for a in track.get("artists", []) if a.get("id")]
+                    album_data = track.get("album", {})
+                    album = album_data.get("name", "Unknown Album")
+                    album_id = album_data.get("id", "")
+                    spotify_url = track.get("external_urls", {}).get("spotify", "")
+                    
+                    # New fields (with defaults for backward compat with old cache)
+                    popularity = track.get("popularity")
+                    duration_ms = track.get("duration_ms")
+                    release_date = album_data.get("release_date")
+                    release_date_precision = album_data.get("release_date_precision")
+                    album_type = album_data.get("album_type")
+                    album_total_tracks = album_data.get("total_tracks")
+                    
+                    # Initialize added_dates dict
+                    added_dates = {}
+                    if added_at:
+                        added_dates[playlist_name] = added_at
+                    
+                    self.tracks[track_id] = TrackInfo(
+                        track_id=track_id,
+                        name=track["name"],
+                        artists=artists,
+                        artist_ids=artist_ids,
+                        album=album,
+                        album_id=album_id,
+                        spotify_url=spotify_url,
+                        playlists=[playlist_name],
+                        in_favorites_playlist=is_favorites,
+                        popularity=popularity,
+                        duration_ms=duration_ms,
+                        release_date=release_date,
+                        release_date_precision=release_date_precision,
+                        album_type=album_type,
+                        album_total_tracks=album_total_tracks,
+                        added_dates=added_dates,
+                        playlist_sizes=playlist_sizes,
+                        active_playlists=active_playlists,
+                    )
+            
+            self.playlist_names.append(playlist_name)
+    
+    def _inject_aggregate_stats(self) -> None:
+        """Compute artist/album stats and inject into TrackInfo for affinity scoring.
+        
+        This must be called after _process_raw_tracks() and before get_likely_favorites()
+        so that affinity_score has access to aggregate data.
+        """
+        # Build artist track counts (how many unique tracks per artist)
+        artist_counts: dict[str, int] = defaultdict(int)
+        for track in self.tracks.values():
+            for artist_id in track.artist_ids:
+                if artist_id:
+                    artist_counts[artist_id] += 1
+        
+        # Build album track counts (how many tracks per album in user's playlists)
+        album_counts: dict[str, int] = defaultdict(int)
+        for track in self.tracks.values():
+            if track.album_id:
+                album_counts[track.album_id] += 1
+        
+        # Inject into each track for use in affinity_score
+        artist_counts_dict = dict(artist_counts)
+        album_counts_dict = dict(album_counts)
+        for track in self.tracks.values():
+            track.artist_track_counts = artist_counts_dict
+            track.album_track_counts = album_counts_dict
+    
     def analyze_user(self, user_id: str) -> dict:
         """Analyze all public playlists for a user."""
-        user_info = self.get_user_info(user_id)
-        playlists = self.get_user_playlists(user_id)
+        raw_data = None
+        from_cache = False
         
-        favorites_playlists = [p for p in playlists if p["is_favorites"]]
+        # Try to load from cache
+        if self.use_cache and not self.refresh_cache:
+            cached = load_cache(user_id)
+            if cached:
+                raw_data = cached
+                from_cache = True
+                if console and RICH_AVAILABLE:
+                    cached_at = cached.get("cached_at", "unknown")
+                    console.print(f"[green]✓[/] Using cached data for user [cyan]{user_id}[/] (cached: {cached_at})\n")
+                else:
+                    print(f"Using cached data for user {user_id}")
         
-        if console and RICH_AVAILABLE:
-            # Use Rich progress bar
-            console.print()
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                BarColumn(bar_width=40),
-                TaskProgressColumn(),
-                TextColumn("[cyan]{task.fields[current]}[/]"),
-                console=console,
-            ) as progress:
-                task = progress.add_task(
-                    f"[green]Scanning {len(playlists)} playlists...",
-                    total=len(playlists),
-                    current=""
-                )
-                
-                for i, playlist in enumerate(playlists, 1):
-                    marker = " ⭐" if playlist["is_favorites"] else ""
-                    progress.update(task, current=f"{playlist['name'][:30]}{marker}")
-                    self.get_playlist_tracks(playlist["id"], playlist["name"], playlist["is_favorites"])
-                    self.playlist_names.append(playlist["name"])
-                    progress.advance(task)
+        # Fetch fresh data if not cached
+        if raw_data is None:
+            if self.refresh_cache and console and RICH_AVAILABLE:
+                console.print("[dim]Refreshing cache...[/]")
             
-            console.print()
+            raw_data = self.fetch_raw_data(user_id)
             
-            # Show filtered count if horizon was applied
-            if self.horizon_cutoff and self.tracks_filtered > 0:
-                console.print(f"[dim]⏱️  Filtered out {self.tracks_filtered:,} tracks outside time horizon[/]\n")
-        else:
-            # Fallback to plain output
-            print(f"Found {len(playlists)} public playlists")
-            for i, playlist in enumerate(playlists, 1):
-                print(f"  [{i}/{len(playlists)}] {playlist['name']}")
-                self.get_playlist_tracks(playlist["id"], playlist["name"], playlist["is_favorites"])
-                self.playlist_names.append(playlist["name"])
-            
-            if self.horizon_cutoff and self.tracks_filtered > 0:
-                print(f"\nFiltered out {self.tracks_filtered:,} tracks outside time horizon")
+            # Save to cache
+            if self.use_cache:
+                save_cache(user_id, raw_data, ttl_hours=self.cache_ttl_hours)
+        
+        # Extract data from raw
+        user_info = raw_data["user_info"]
+        playlists = raw_data["playlists"]
+        playlist_tracks = raw_data["playlist_tracks"]
+        
+        # Compute favorites at runtime (not cached) so logic changes apply to cached data
+        favorites_playlists = [p for p in playlists if is_favorites_playlist(p["name"])]
+        
+        # Process raw tracks into TrackInfo objects
+        if from_cache:
+            if console and RICH_AVAILABLE:
+                console.print(f"[dim]Processing {len(playlists)} playlists from cache...[/]\n")
+            else:
+                print(f"Processing {len(playlists)} playlists from cache")
+        
+        self._process_raw_tracks(playlists, playlist_tracks, user_id)
+        
+        # Inject aggregate stats for affinity scoring
+        self._inject_aggregate_stats()
+        
+        # Show filtering stats
+        if self.playlists_skipped_owner > 0:
+            if console and RICH_AVAILABLE:
+                console.print(f"[dim]👤 Skipped {self.playlists_skipped_owner} playlists not owned by user[/]")
+            else:
+                print(f"Skipped {self.playlists_skipped_owner} playlists not owned by user")
+        
+        if self.horizon_cutoff:
+            filter_parts = []
+            if self.tracks_filtered > 0:
+                filter_parts.append(f"{self.tracks_filtered:,} outside time horizon")
+            if self.tracks_missing_added_at > 0:
+                filter_parts.append(f"{self.tracks_missing_added_at:,} missing add date")
+            if filter_parts:
+                filter_msg = ", ".join(filter_parts)
+                if console and RICH_AVAILABLE:
+                    console.print(f"[dim]⏱️  Filtered out {filter_msg}[/]\n")
+                else:
+                    print(f"\nFiltered out {filter_msg}")
         
         # Sort tracks by frequency (number of playlists they appear in)
         sorted_tracks = sorted(
@@ -617,23 +1379,54 @@ class SpotifyAnalyzer:
             key=lambda t: (-t.count, t.name.lower())
         )
         
+        # Analyze temporal patterns (evergreen favorites, early adopter behavior)
+        temporal_patterns = self.analyze_temporal_patterns()
+        
         # Aggregate data
         albums = self.aggregate_albums()
         artists = self.aggregate_artists()
         likely_favorites = self.get_likely_favorites()
         
+        # Get versatile tracks (sorted by versatility_score)
+        versatile_tracks = sorted(
+            [t for t in self.tracks.values() if t.count > 1],
+            key=lambda t: (-t.versatility_score, -t.count, t.name.lower())
+        )
+        
+        # Identify albums with high completion ratio
+        favorite_albums = [a for a in albums if a.is_likely_favorite_album]
+        
+        # Get playlist classification stats (only from owned playlists)
+        active_playlist_names = list(self._active_playlists) if hasattr(self, '_active_playlists') else []
+        owned_playlist_names = list(self._playlist_sizes.keys()) if hasattr(self, '_playlist_sizes') else []
+        archive_playlist_names = [name for name in owned_playlist_names if name not in active_playlist_names]
+        
+        # Count owned playlists (total minus skipped)
+        owned_playlists_count = len(playlists) - self.playlists_skipped_owner
+        
         return {
             "user": user_info,
             "is_self_analysis": False,
             "total_playlists": len(playlists),
-            "favorites_playlists": [p["name"] for p in favorites_playlists],
+            "playlists_analyzed": owned_playlists_count,
+            "playlists_skipped_owner": self.playlists_skipped_owner,
+            "favorites_playlists": [p["name"] for p in favorites_playlists if p.get("owner") == user_id],
             "total_unique_tracks": len(self.tracks),
             "tracks_filtered": self.tracks_filtered,
+            "tracks_missing_added_at": self.tracks_missing_added_at,
             "horizon_cutoff": self.horizon_cutoff.isoformat() if self.horizon_cutoff else None,
             "tracks": sorted_tracks,
             "albums": albums,
             "artists": artists,
             "likely_favorites": likely_favorites,
+            "versatile_tracks": versatile_tracks,
+            "favorite_albums": favorite_albums,
+            "temporal_patterns": temporal_patterns,
+            "playlist_classification": {
+                "active": active_playlist_names,
+                "archive": archive_playlist_names,
+            },
+            "from_cache": from_cache,
         }
 
 
@@ -832,21 +1625,32 @@ def print_report_rich(analysis: dict, top_n: int = 50) -> None:
     horizon_line = ""
     if analysis.get("horizon_cutoff"):
         cutoff_date = datetime.fromisoformat(analysis["horizon_cutoff"]).strftime("%Y-%m-%d")
-        horizon_line = f"\n[white]Time Horizon:[/] [yellow]Since {cutoff_date}[/]"
+        filter_parts = []
         if analysis.get("tracks_filtered", 0) > 0:
-            horizon_line += f" [dim]({analysis['tracks_filtered']:,} older tracks filtered)[/]"
+            filter_parts.append(f"{analysis['tracks_filtered']:,} outside horizon")
+        if analysis.get("tracks_missing_added_at", 0) > 0:
+            filter_parts.append(f"{analysis['tracks_missing_added_at']:,} missing date")
+        filter_info = f" [dim]({', '.join(filter_parts)} filtered)[/]" if filter_parts else ""
+        horizon_line = f"\n[white]Time Horizon:[/] [yellow]Since {cutoff_date}[/]{filter_info}"
+    
+    # Build playlists info showing analyzed vs skipped
+    playlists_analyzed = analysis.get("playlists_analyzed", analysis["total_playlists"])
+    playlists_skipped = analysis.get("playlists_skipped_owner", 0)
+    playlists_info = f"[green]{playlists_analyzed}[/]"
+    if playlists_skipped > 0:
+        playlists_info += f" [dim]({playlists_skipped} non-owned skipped)[/]"
     
     header_content = f"""[bold cyan]{user['display_name']}[/]
 [dim]{user['profile_url']}[/]
 
 [white]Followers:[/] [green]{user['followers']:,}[/]
-[white]Public Playlists:[/] [green]{analysis['total_playlists']}[/]
+[white]Playlists Analyzed:[/] {playlists_info}
 [white]Unique Tracks:[/] [green]{analysis['total_unique_tracks']:,}[/]{horizon_line}"""
     
     console.print(Panel(
         header_content,
         title="[bold white]🎵 SPOTIFY PLAYLIST ANALYSIS[/]",
-        subtitle=f"[dim]Analyzed {analysis['total_playlists']} playlists[/]",
+        subtitle=f"[dim]Analyzed {playlists_analyzed} playlists[/]",
         border_style="bright_green",
         padding=(1, 2),
     ))
@@ -858,10 +1662,10 @@ def print_report_rich(analysis: dict, top_n: int = 50) -> None:
             fav_text += f" (+{len(analysis['favorites_playlists']) - 5} more)"
         console.print(f"[dim]⭐ Detected favorites playlists: {fav_text}[/]\n")
     
-    # ===== LIKELY ALL-TIME FAVORITES =====
+    # ===== LIKELY ALL-TIME FAVORITES (Affinity Score) =====
     console.print(Panel(
-        "[bold]Songs in multiple playlists or in 'favorites' playlists[/]",
-        title="[bold yellow]⭐ LIKELY ALL-TIME FAVORITES[/]",
+        "[bold]Tracks you probably actually love - ranked by affinity score[/]",
+        title="[bold yellow]⭐ LIKELY FAVORITES (Affinity)[/]",
         border_style="yellow",
     ))
     
@@ -870,26 +1674,68 @@ def print_report_rich(analysis: dict, top_n: int = 50) -> None:
     if likely_favorites:
         fav_table = Table(box=box.ROUNDED, show_header=True, header_style="bold magenta")
         fav_table.add_column("#", style="dim", width=4, justify="right")
-        fav_table.add_column("Song", style="white", max_width=35)
-        fav_table.add_column("Artist", style="cyan", max_width=25)
-        fav_table.add_column("Album", style="dim", max_width=25)
-        fav_table.add_column("📋", justify="center", width=4)
-        fav_table.add_column("⭐", justify="center", width=3)
+        fav_table.add_column("Song", style="white", max_width=30)
+        fav_table.add_column("Artist", style="cyan", max_width=22)
+        fav_table.add_column("Affinity", justify="right", width=8)
+        fav_table.add_column("📋", justify="center", width=3)
+        fav_table.add_column("Pop", justify="right", width=4)
+        fav_table.add_column("⭐", justify="center", width=2)
         
         for i, track in enumerate(likely_favorites[:15], 1):
             fav_marker = "⭐" if track.in_favorites_playlist else ""
+            pop_str = str(track.popularity) if track.popularity is not None else "-"
+            
             fav_table.add_row(
                 str(i),
-                track.name[:35],
-                track.artists_str[:25],
-                track.album[:25],
+                track.name[:30],
+                track.artists_str[:22],
+                str(track.affinity_score),
                 str(track.count),
+                pop_str,
                 fav_marker,
             )
         
         console.print(fav_table)
+        console.print("[dim]Affinity = artist dedication + album depth + recency + cross-context + focused playlists[/]")
     else:
         console.print("[dim]No clear favorites detected.[/]")
+    
+    console.print()
+    
+    # ===== VERSATILE TRACKS (Context-Fitting) =====
+    console.print(Panel(
+        "[bold]Tracks that fit many contexts - may not be your most-played[/]",
+        title="[bold cyan]🎭 VERSATILE TRACKS (Context-Fitting)[/]",
+        border_style="cyan",
+    ))
+    
+    versatile_tracks = analysis.get("versatile_tracks", [])[:top_n]
+    
+    if versatile_tracks:
+        vers_table = Table(box=box.ROUNDED, show_header=True, header_style="bold cyan")
+        vers_table.add_column("#", style="dim", width=4, justify="right")
+        vers_table.add_column("Song", style="white", max_width=30)
+        vers_table.add_column("Artist", style="cyan", max_width=22)
+        vers_table.add_column("Versatility", justify="right", width=10)
+        vers_table.add_column("📋", justify="center", width=3)
+        vers_table.add_column("Pop", justify="right", width=4)
+        
+        for i, track in enumerate(versatile_tracks[:15], 1):
+            pop_str = str(track.popularity) if track.popularity is not None else "-"
+            
+            vers_table.add_row(
+                str(i),
+                track.name[:30],
+                track.artists_str[:22],
+                str(track.versatility_score),
+                str(track.count),
+                pop_str,
+            )
+        
+        console.print(vers_table)
+        console.print("[dim]Versatility = playlist count + popularity + context diversity (crowd pleasers)[/]")
+    else:
+        console.print("[dim]No versatile tracks detected.[/]")
     
     console.print()
     
@@ -1015,10 +1861,47 @@ def print_report_rich(analysis: dict, top_n: int = 50) -> None:
     
     console.print()
     
+    # ===== METHODOLOGY NOTE =====
+    methodology_text = """[bold]How to interpret these results:[/]
+
+[yellow]Affinity Score[/] estimates actual favorites using:
+  • Artist dedication (tracks from artists you add frequently)
+  • Album depth (multiple tracks from same album)
+  • Playlist presence (exponential bonus for 2+ playlists)
+  • Favorites + cross-context (in favorites AND other playlists)
+  • Recency (recently added tracks score higher)
+  • Early adopter bonus (added soon after release)
+  • Small playlist bonus (focused curation signal)
+  • Obscurity bonus / popularity penalty (mainstream hits penalized)
+
+[cyan]Versatility Score[/] measures context-fitting:
+  • High playlist count = fits many moods/situations
+  • Popular tracks get a bonus (mainstream appeal)
+  • May not reflect actual listening frequency
+
+[dim]Limitation: This analysis sees playlist curation, not play counts.
+Songs in a single playlist you play daily won't rank as highly.
+Your Spotify Wrapped may differ significantly from these results.[/]"""
+    
+    console.print(Panel(
+        methodology_text,
+        title="[bold white]📊 METHODOLOGY NOTE[/]",
+        border_style="dim",
+    ))
+    
+    console.print()
+    
     # ===== FOOTER =====
     footer_text = f"[dim]Analyzed [green]{analysis['total_unique_tracks']:,}[/] unique tracks across [green]{analysis['total_playlists']}[/] playlists[/]"
     if analysis.get("tracks_filtered", 0) > 0:
         footer_text += f"\n[dim]({analysis['tracks_filtered']:,} tracks filtered by time horizon)[/]"
+    
+    # Show playlist classification summary
+    playlist_class = analysis.get("playlist_classification", {})
+    active_count = len(playlist_class.get("active", []))
+    archive_count = len(playlist_class.get("archive", []))
+    if active_count or archive_count:
+        footer_text += f"\n[dim]Playlists: {active_count} active rotation, {archive_count} archive/compilation[/]"
     
     console.print(Panel(
         footer_text,
@@ -1039,14 +1922,24 @@ def print_report_plain(analysis: dict, top_n: int = 50) -> None:
     print(f"\nUser: {user['display_name']}")
     print(f"Profile: {user['profile_url']}")
     print(f"Followers: {user['followers']:,}")
-    print(f"\nTotal Public Playlists: {analysis['total_playlists']}")
+    
+    playlists_analyzed = analysis.get("playlists_analyzed", analysis["total_playlists"])
+    playlists_skipped = analysis.get("playlists_skipped_owner", 0)
+    print(f"\nPlaylists Analyzed: {playlists_analyzed}")
+    if playlists_skipped > 0:
+        print(f"  ({playlists_skipped} non-owned playlists skipped)")
     print(f"Total Unique Tracks: {analysis['total_unique_tracks']:,}")
     
     if analysis.get("horizon_cutoff"):
         cutoff_date = datetime.fromisoformat(analysis["horizon_cutoff"]).strftime("%Y-%m-%d")
         print(f"Time Horizon: Since {cutoff_date}")
+        filter_parts = []
         if analysis.get("tracks_filtered", 0) > 0:
-            print(f"  ({analysis['tracks_filtered']:,} older tracks filtered)")
+            filter_parts.append(f"{analysis['tracks_filtered']:,} outside horizon")
+        if analysis.get("tracks_missing_added_at", 0) > 0:
+            filter_parts.append(f"{analysis['tracks_missing_added_at']:,} missing date")
+        if filter_parts:
+            print(f"  ({', '.join(filter_parts)} filtered)")
     
     if analysis["favorites_playlists"]:
         print(f"\nDetected 'Favorites' Playlists:")
@@ -1140,14 +2033,21 @@ def export_to_json(analysis: dict, filepath: str) -> None:
         }
     else:
         # Standard playlist analysis export format
+        playlist_class = analysis.get("playlist_classification", {})
+        active_playlists_set = set(playlist_class.get("active", []))
+        
         export_data = {
             "user": analysis["user"],
             "is_self_analysis": False,
             "total_playlists": analysis["total_playlists"],
+            "playlists_analyzed": analysis.get("playlists_analyzed", analysis["total_playlists"]),
+            "playlists_skipped_owner": analysis.get("playlists_skipped_owner", 0),
             "favorites_playlists": analysis["favorites_playlists"],
             "total_unique_tracks": analysis["total_unique_tracks"],
             "horizon_cutoff": analysis.get("horizon_cutoff"),
             "tracks_filtered": analysis.get("tracks_filtered", 0),
+            "tracks_missing_added_at": analysis.get("tracks_missing_added_at", 0),
+            "playlist_classification": playlist_class,
             "likely_favorites": [
                 {
                     "rank": i,
@@ -1157,10 +2057,28 @@ def export_to_json(analysis: dict, filepath: str) -> None:
                     "spotify_url": t.spotify_url,
                     "playlist_count": t.count,
                     "in_favorites_playlist": t.in_favorites_playlist,
-                    "favorites_score": t.favorites_weight,
+                    "affinity_score": t.affinity_score,
+                    "versatility_score": t.versatility_score,
+                    "popularity": t.popularity,
                     "playlists": t.playlists,
+                    "in_active_playlists": [p for p in t.playlists if p in active_playlists_set],
                 }
                 for i, t in enumerate(analysis["likely_favorites"][:100], 1)
+            ],
+            "versatile_tracks": [
+                {
+                    "rank": i,
+                    "name": t.name,
+                    "artists": t.artists,
+                    "album": t.album,
+                    "spotify_url": t.spotify_url,
+                    "playlist_count": t.count,
+                    "affinity_score": t.affinity_score,
+                    "versatility_score": t.versatility_score,
+                    "popularity": t.popularity,
+                    "playlists": t.playlists,
+                }
+                for i, t in enumerate(analysis.get("versatile_tracks", [])[:100], 1)
             ],
             "favorite_albums": [
                 {
@@ -1169,6 +2087,8 @@ def export_to_json(analysis: dict, filepath: str) -> None:
                     "artist": a.artist,
                     "track_count": len(a.tracks),
                     "total_appearances": a.total_appearances,
+                    "completion_ratio": a.completion_ratio,
+                    "is_likely_favorite": a.is_likely_favorite_album,
                     "tracks": a.tracks,
                 }
                 for i, a in enumerate(analysis["albums"][:50], 1)
@@ -1193,6 +2113,8 @@ def export_to_json(analysis: dict, filepath: str) -> None:
                     "album": t.album,
                     "spotify_url": t.spotify_url,
                     "playlist_count": t.count,
+                    "affinity_score": t.affinity_score,
+                    "versatility_score": t.versatility_score,
                     "playlists": t.playlists,
                 }
                 for i, t in enumerate(analysis["tracks"], 1)
@@ -1218,8 +2140,15 @@ Examples:
   %(prog)s 1234567890 --top 20           # Show top 20 items per category
   %(prog)s 1234567890 --output report.json
   %(prog)s 1234567890 --horizon 1y       # Only tracks added in the last year
+  %(prog)s 1234567890 --refresh-cache    # Force refresh cached data
+  %(prog)s 1234567890 --no-cache         # Disable caching, always fetch fresh
   %(prog)s --self                        # Analyze YOUR listening history (requires login)
   %(prog)s --self --output my_stats.json
+
+Caching:
+  By default, Spotify data is cached locally in .spotify_cache/ to speed up
+  repeated analyses. Cache is keyed by user ID and expires after 24 hours.
+  Use --no-cache to disable caching or --refresh-cache to force a refresh.
 
 Environment Variables:
   SPOTIPY_CLIENT_ID      Your Spotify app client ID
@@ -1260,12 +2189,34 @@ Note: For --self mode, add http://localhost:8080/callback as a Redirect URI in y
         metavar="PERIOD",
         help="Only include tracks added within this time period (e.g., '1y', '6m', '30d'). Not used with --self."
     )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Disable cache and always fetch fresh data from Spotify API"
+    )
+    parser.add_argument(
+        "--refresh-cache",
+        action="store_true",
+        help="Force refresh the cached data for this user"
+    )
+    parser.add_argument(
+        "--cache-ttl",
+        type=int,
+        default=DEFAULT_CACHE_TTL_HOURS,
+        metavar="HOURS",
+        help=f"Cache time-to-live in hours (default: {DEFAULT_CACHE_TTL_HOURS})"
+    )
     
     args = parser.parse_args()
     
     # Validate arguments
     if not args.self_mode and not args.user_id:
         parser.error("Either provide a user_id or use --self flag")
+    
+    # Cache settings
+    use_cache = not args.no_cache
+    refresh_cache = args.refresh_cache
+    cache_ttl = args.cache_ttl
     
     if args.self_mode:
         # Self-analysis mode using OAuth
@@ -1276,7 +2227,12 @@ Note: For --self mode, add http://localhost:8080/callback as a Redirect URI in y
                 border_style="bright_magenta",
             ))
         
-        analyzer = SpotifyAnalyzer(use_oauth=True)
+        analyzer = SpotifyAnalyzer(
+            use_oauth=True,
+            use_cache=use_cache,
+            refresh_cache=refresh_cache,
+            cache_ttl_hours=cache_ttl,
+        )
         analysis = analyzer.analyze_self()
     else:
         # Standard playlist analysis mode
@@ -1302,13 +2258,24 @@ Note: For --self mode, add http://localhost:8080/callback as a Redirect URI in y
             if horizon_cutoff:
                 horizon_info = f"\n[dim]Time horizon: Since {horizon_cutoff.strftime('%Y-%m-%d')}[/]"
             
+            cache_info = ""
+            if not use_cache:
+                cache_info = "\n[dim]Cache: disabled[/]"
+            elif refresh_cache:
+                cache_info = "\n[dim]Cache: refreshing[/]"
+            
             console.print(Panel(
-                f"[bold green]Analyzing user:[/] [cyan]{user_id}[/]{horizon_info}",
+                f"[bold green]Analyzing user:[/] [cyan]{user_id}[/]{horizon_info}{cache_info}",
                 title="[bold white]🎵 Spotify Playlist Analyzer[/]",
                 border_style="bright_blue",
             ))
         
-        analyzer = SpotifyAnalyzer(horizon_cutoff=horizon_cutoff)
+        analyzer = SpotifyAnalyzer(
+            horizon_cutoff=horizon_cutoff,
+            use_cache=use_cache,
+            refresh_cache=refresh_cache,
+            cache_ttl_hours=cache_ttl,
+        )
         analysis = analyzer.analyze_user(user_id)
     
     print_report(analysis, top_n=args.top)

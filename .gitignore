@@ -14,3 +14,4 @@ __pycache__/
 !pyproject.toml
 
 .cache
+.spotify_cache/
